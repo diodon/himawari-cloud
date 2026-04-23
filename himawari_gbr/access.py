@@ -351,15 +351,68 @@ def generate_reference(
     return ref_path
 
 
+def generate_reference_from_template(
+    s3_key: str,
+    template_path: Path,
+    template_s3_key: str,
+    cache_dir: Path,
+    force: bool = False,
+) -> Path:
+    """Create a kerchunk reference by substituting the URL in a template reference.
+
+    Assumes chunk byte offsets and lengths are identical to the template file —
+    a safe assumption for NOAA operational Himawari-9 products, which are all
+    written by the same pipeline with the same HDF5 chunk layout.  No S3 I/O
+    is required; the result is derived from pure file reads and writes.
+
+    Parameters
+    ----------
+    s3_key:
+        S3 key for the new file.
+    template_path:
+        Local path to an existing reference JSON (from :func:`generate_reference`).
+    template_s3_key:
+        The S3 key used to build the template (its URL is replaced).
+    cache_dir:
+        Root directory for caching.
+    force:
+        Overwrite even if the output already exists.
+
+    Returns
+    -------
+    Path
+        Local path to the new reference JSON.
+    """
+    ref_path = _ref_cache_path(s3_key, cache_dir)
+    if ref_path.exists() and not force:
+        return ref_path
+
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+
+    content = template_path.read_text()
+    new_content = content.replace(f"s3://{template_s3_key}", f"s3://{s3_key}")
+    ref_path.write_text(new_content)
+
+    logger.info("Cached (template): %s", ref_path.name)
+    return ref_path
+
+
 def build_references_parallel(
     s3_keys: list[str],
     cache_dir: Path,
     max_workers: int = 8,
     force: bool = False,
+    use_template: bool = True,
 ) -> list[Path]:
     """Generate kerchunk JSON references for multiple files in parallel.
 
-    Thread-safe: each worker uses its own S3FileSystem connection.
+    When *use_template* is ``True`` (the default), only the first reference is
+    built by parsing HDF5 metadata from S3.  All remaining references are derived
+    from that template via URL substitution — pure file I/O that takes milliseconds
+    instead of minutes per file.  This relies on the assumption that NOAA's
+    operational pipeline writes all files with an identical internal chunk layout
+    (same byte offsets and lengths).  Pass ``use_template=False`` to fall back to
+    generating each reference independently if that assumption does not hold.
 
     Parameters
     ----------
@@ -371,20 +424,57 @@ def build_references_parallel(
         Maximum parallel threads.  Recommend ≤8 to avoid S3 throttling.
     force:
         Regenerate even when cached files exist.
+    use_template:
+        Derive all-but-one references from a single template instead of parsing
+        each file's HDF5 metadata from S3.
 
     Returns
     -------
     list[Path]
         Reference file paths in the same order as *s3_keys*.
     """
-    # Check which files are already cached to avoid spawning unnecessary threads
     uncached = [k for k in s3_keys if force or not _ref_cache_path(k, cache_dir).exists()]
     logger.info("%d/%d references need generating", len(uncached), len(s3_keys))
 
-    if uncached:
-        fs = _make_fs()
-        errors: dict[str, Exception] = {}
+    if not uncached:
+        return [_ref_cache_path(k, cache_dir) for k in s3_keys]
 
+    errors: dict[str, Exception] = {}
+
+    if use_template:
+        # Prefer an already-cached reference as template to avoid any S3 round-trip.
+        # If none exist yet, generate one from S3 first.
+        template_key = next(
+            (k for k in s3_keys if _ref_cache_path(k, cache_dir).exists()), None
+        )
+        if template_key is None:
+            generate_reference(uncached[0], cache_dir, fs=_make_fs(), force=force)
+            template_key = uncached[0]
+            uncached = uncached[1:]
+
+        if uncached:
+            template_path = _ref_cache_path(template_key, cache_dir)
+            logger.info(
+                "Building %d references from template %s",
+                len(uncached),
+                template_key.split("/")[-1],
+            )
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(
+                        generate_reference_from_template,
+                        key, template_path, template_key, cache_dir, force,
+                    ): key
+                    for key in uncached
+                }
+                for future in as_completed(futures):
+                    key = futures[future]
+                    exc = future.exception()
+                    if exc is not None:
+                        logger.error("Failed to generate reference for %s: %s", key, exc)
+                        errors[key] = exc
+    else:
+        fs = _make_fs()
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
                 pool.submit(generate_reference, key, cache_dir, fs, force): key
@@ -397,11 +487,11 @@ def build_references_parallel(
                     logger.error("Failed to generate reference for %s: %s", key, exc)
                     errors[key] = exc
 
-        if errors:
-            raise RuntimeError(
-                f"Reference generation failed for {len(errors)} file(s): "
-                + ", ".join(errors)
-            )
+    if errors:
+        raise RuntimeError(
+            f"Reference generation failed for {len(errors)} file(s): "
+            + ", ".join(errors)
+        )
 
     return [_ref_cache_path(k, cache_dir) for k in s3_keys]
 
