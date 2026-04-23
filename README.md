@@ -80,18 +80,25 @@ provided for custom regions.
 
 ## Installation
 
-Requires Python ≥ 3.11. Install with [uv](https://docs.astral.sh/uv/):
+Requires Python ≥ 3.13. Install with [uv](https://docs.astral.sh/uv/):
 
 ```bash
 git clone git@github.com:diodon/himawari-cloud.git
 cd himawari-cloud
+
+# Core pipeline only
 uv sync
+
+# Core + JupyterLab (to run the workflow notebook)
+uv sync --group notebook
+uv run jupyter lab
 ```
 
 Or with pip:
 
 ```bash
 pip install -e .
+pip install jupyterlab   # to run the workflow notebook
 ```
 
 No AWS credentials are required — the NOAA Himawari-9 bucket is publicly readable.
