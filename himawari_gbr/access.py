@@ -402,17 +402,21 @@ def build_references_parallel(
     cache_dir: Path,
     max_workers: int = 8,
     force: bool = False,
-    use_template: bool = True,
+    use_template: bool = False,
 ) -> list[Path]:
     """Generate kerchunk JSON references for multiple files in parallel.
 
-    When *use_template* is ``True`` (the default), only the first reference is
-    built by parsing HDF5 metadata from S3.  All remaining references are derived
-    from that template via URL substitution — pure file I/O that takes milliseconds
-    instead of minutes per file.  This relies on the assumption that NOAA's
-    operational pipeline writes all files with an identical internal chunk layout
-    (same byte offsets and lengths).  Pass ``use_template=False`` to fall back to
-    generating each reference independently if that assumption does not hold.
+    When *use_template* is ``True``, only the first reference is built by parsing
+    HDF5 metadata from S3.  All remaining references are derived from that template
+    via URL substitution — pure file I/O that takes milliseconds instead of minutes
+    per file.  This relies on the assumption that the producer writes all files with
+    an **identical internal chunk layout** (same byte offsets and lengths for every
+    chunk in every variable).  If the assumption does not hold, downstream reads will
+    silently fetch wrong bytes and fail with decompression errors.
+
+    For NOAA Himawari-9 operational products this assumption holds within a single
+    product type (CMSK, CHGT, or CPHS) when all files share the same software
+    version and data shape — but verify first before enabling in production.
 
     Parameters
     ----------
@@ -923,5 +927,14 @@ def load_gbr_cloud_data(
     if len(product_datasets) == 1:
         return product_datasets[0]
 
-    # Merge multiple products that share (time, Rows, Columns)
-    return xr.merge(product_datasets, join="inner")
+    # Merge products along shared (time, Rows, Columns) dimensions.
+    # Keep Lat/Lon only from the first dataset — they are identical across all
+    # products (fixed geostationary grid) and the default xarray merge compat
+    # would otherwise download them from every product to verify equality.
+    merged = product_datasets[0]
+    for ds in product_datasets[1:]:
+        merged = xr.merge(
+            [merged, ds.drop_vars(COORD_VARS, errors="ignore")],
+            join="inner",
+        )
+    return merged
