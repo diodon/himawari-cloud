@@ -37,6 +37,8 @@ S3 keys   s3://noaa-himawari9/AHI-L2-FLDK-Clouds/{YYYY}/{MM}/{DD}/{HHMM}/AHI-{PR
 Per-file S3 keys
     │
     ▼  build_references_parallel()   ──►  cached JSON files (~2 MB each)
+    │      • default: SingleHdf5ToZarr per file (safe, one S3 call per file)
+    │      • templates_dir=…: URL substitution from product template (zero S3 calls)
 Kerchunk refs   {"CloudMask/5.3": ["s3://...", offset, length], ...}
     │
     ▼  build_combined_reference()    ──►  cached Parquet store dir
@@ -55,6 +57,32 @@ A kerchunk JSON reference maps every HDF5 chunk in a NetCDF4 file to a
 `[url, byte_offset, length]` triple. `fsspec` translates these into HTTP Range requests
 so xarray only downloads the chunks that intersect the GBR bounding box — regardless of
 whether a single time step or a full day is being read.
+
+### Product templates for fast reference generation
+
+Because NOAA's operational pipeline writes all files of a given product with the same
+internal HDF5 chunk layout (identical byte offsets), a single reference JSON can serve
+as a structural template for all other files of the same product. Only the S3 URL needs
+to change.
+
+Run the template script once to generate `CMSK_template.json`, `CHGT_template.json`, and
+`CPHS_template.json` in `~/.cache/himawari-gbr/templates/`:
+
+```bash
+python scripts/create_product_templates.py
+python scripts/create_product_templates.py --date 2024-06-01   # use a different source file
+```
+
+Then pass `templates_dir` to the pipeline to skip all per-file S3 metadata requests:
+
+```python
+TEMPLATES = Path("~/.cache/himawari-gbr/templates").expanduser()
+ds = load_gbr_cloud_data(["CMSK", "CHGT"], start, end, templates_dir=TEMPLATES)
+```
+
+This reduces reference generation from O(N) S3 round-trips to O(0) — milliseconds instead
+of minutes for any number of files. Omit `templates_dir` to fall back to safe per-file
+generation whenever the layout assumption may not hold (e.g. after a NOAA software update).
 
 ### Multi-file time-series via Parquet store
 
@@ -111,12 +139,15 @@ No AWS credentials are required — the NOAA Himawari-9 bucket is publicly reada
 
 ```python
 from datetime import datetime
+from pathlib import Path
 from himawari_gbr.access import load_gbr_cloud_data
 
 ds = load_gbr_cloud_data(
     products=["CMSK", "CHGT"],
     start_dt=datetime(2024, 1, 1,  0, 0),
     end_dt  =datetime(2024, 1, 1,  0, 50),  # 6 time steps
+    # Optional: skip all per-file S3 metadata calls after running the template script
+    # templates_dir=Path("~/.cache/himawari-gbr/templates").expanduser(),
 )
 # ds is fully lazy — dims: (time=6, Rows=1170, Columns=1104)
 
@@ -169,9 +200,15 @@ cm = ds_gbr["CloudMask"].compute()
 ### `list_product_files(product, start_dt, end_dt)`
 List all AHI L2 S3 keys for a product and UTC time window. Iterates 10-minute slots.
 
-### `build_references_parallel(s3_keys, cache_dir, max_workers=8)`
+### `build_references_parallel(s3_keys, cache_dir, max_workers=8, templates_dir=None, use_template=False)`
 Generate (or load cached) kerchunk JSON references for multiple files using a thread pool.
-Each worker uses its own S3 connection; recommend ≤ 8 workers to avoid throttling.
+Three modes in order of preference:
+- **`templates_dir`** — directory of product templates produced by
+  `scripts/create_product_templates.py`; derives all references via URL substitution
+  with zero S3 round-trips.
+- **`use_template=True`** — generates one reference from S3 and templates the rest;
+  opt-in because it assumes identical internal file layouts.
+- **default** — generates each reference independently from S3 (safe, one call per file).
 
 ### `build_combined_reference(ref_paths, s3_keys, output_dir)`
 Combine per-file references into a Parquet virtual store via `MultiZarrToZarr`.
@@ -193,9 +230,10 @@ Slice a full-disk Dataset to the GBR bounding box using `.isel()`. Must be calle
 One-time utility to derive pixel bounds for a custom geographic region from the embedded
 `Latitude`/`Longitude` arrays.
 
-### `load_gbr_cloud_data(products, start_dt, end_dt, cache_dir=None, ...)`
+### `load_gbr_cloud_data(products, start_dt, end_dt, cache_dir=None, templates_dir=None, ...)`
 Full-pipeline convenience wrapper. Runs all steps above, merges multiple products along
-shared dimensions, and returns a lazy GBR-subsetted Dataset.
+shared dimensions, and returns a lazy GBR-subsetted Dataset. Pass `templates_dir` to
+enable zero-S3-call reference generation for all products.
 
 ---
 
@@ -224,6 +262,10 @@ Fill values (off-disk / no-retrieval pixels) are encoded as `NaN` after `mask_an
 
 ```
 ~/.cache/himawari-gbr/
+├── templates/                                         (created by create_product_templates.py)
+│   ├── CMSK_template.json                             (~2 MB, _template_source embedded)
+│   ├── CHGT_template.json
+│   └── CPHS_template.json
 ├── refs/
 │   └── AHI-L2-FLDK-Clouds/2024/01/01/0000/
 │       ├── AHI-CMSK_v1r1_h09_s202401010000...json   (~2 MB per file)
@@ -238,7 +280,7 @@ Fill values (off-disk / no-retrieval pixels) are encoded as `NaN` after `mask_an
 
 Kerchunk JSON references (~2 MB each) are reused across different time-window queries.
 Combined Parquet stores are keyed by product and time window; use `force_rebuild=True` to
-regenerate.
+regenerate. Product templates only need to be regenerated after a NOAA software update.
 
 ---
 
@@ -260,6 +302,22 @@ not yet compatible with the kerchunk reference filesystem interface used here.
 
 ---
 
+## Scripts
+
+### `scripts/create_product_templates.py`
+
+One-time setup that fetches a single file per product and saves a reusable kerchunk
+reference template. Run this before using `templates_dir` in the pipeline:
+
+```bash
+python scripts/create_product_templates.py
+python scripts/create_product_templates.py --date 2024-06-01 --cache-dir /fast/ssd/cache
+```
+
+Re-run if NOAA deploys a new software version that changes the internal HDF5 file layout.
+
+---
+
 ## Workflow notebook
 
 `himawari_gbr_workflow.ipynb` walks through the entire pipeline with detailed explanations,
@@ -268,7 +326,7 @@ including:
 - S3 path structure and file naming conventions
 - Kerchunk reference internals (chunk key format, fill-value patch)
 - GBR pixel bounds derivation and chunk reduction math
-- Parallel reference generation and Parquet store building
+- Parallel reference generation: default (per-file S3) and template-based (zero S3 calls)
 - Multi-product merge and time-series analysis
 - Cloud fraction time-series and cloud-top height scatter plots
 - Cache management and performance tips
