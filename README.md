@@ -60,29 +60,37 @@ whether a single time step or a full day is being read.
 
 ### Product templates for fast reference generation
 
-Because NOAA's operational pipeline writes all files of a given product with the same
-internal HDF5 chunk layout (identical byte offsets), a single reference JSON can serve
-as a structural template for all other files of the same product. Only the S3 URL needs
-to change.
+An optional fast path skips per-file S3 metadata calls by deriving references from a
+pre-built template via URL substitution alone.  This assumes every file of the same product
+shares **identical internal HDF5 chunk byte offsets** — an assumption that holds only when
+zlib-compressed chunk sizes are uniform across files.
 
-Run the template script once to generate `CMSK_template.json`, `CHGT_template.json`, and
-`CPHS_template.json` in `~/.cache/himawari-gbr/templates/`:
+> **CHGT and CPHS are not safe for template-based generation.**  These products store
+> continuous floating-point retrievals (cloud-top height, temperature, pressure, phase) whose
+> compressed sizes vary significantly between scan times, causing chunk byte offsets to shift
+> from file to file.  Using `templates_dir` for them produces silently wrong references that
+> fail with `Error -3 while decompressing data: incorrect header check` at read time.
+> Always use the default per-file generation for CHGT and CPHS.
+
+Run the template script once to generate `CMSK_template.json` in
+`~/.cache/himawari-gbr/templates/` (CHGT and CPHS templates are created but should not be
+used with `templates_dir`):
 
 ```bash
 python scripts/create_product_templates.py
 python scripts/create_product_templates.py --date 2024-06-01   # use a different source file
 ```
 
-Then pass `templates_dir` to the pipeline to skip all per-file S3 metadata requests:
+Then pass `templates_dir` **only for CMSK** to skip per-file S3 metadata requests:
 
 ```python
 TEMPLATES = Path("~/.cache/himawari-gbr/templates").expanduser()
-ds = load_gbr_cloud_data(["CMSK", "CHGT"], start, end, templates_dir=TEMPLATES)
+# Safe for CMSK only — do not pass templates_dir when loading CHGT or CPHS
+ds = load_gbr_cloud_data(["CMSK"], start, end, templates_dir=TEMPLATES)
 ```
 
-This reduces reference generation from O(N) S3 round-trips to O(0) — milliseconds instead
-of minutes for any number of files. Omit `templates_dir` to fall back to safe per-file
-generation whenever the layout assumption may not hold (e.g. after a NOAA software update).
+Omit `templates_dir` (the default) for CHGT/CPHS, or for any product after a NOAA
+software update that may change the internal file layout.
 
 ### Multi-file time-series via Parquet store
 
@@ -146,8 +154,7 @@ ds = load_gbr_cloud_data(
     products=["CMSK", "CHGT"],
     start_dt=datetime(2024, 1, 1,  0, 0),
     end_dt  =datetime(2024, 1, 1,  0, 50),  # 6 time steps
-    # Optional: skip all per-file S3 metadata calls after running the template script
-    # templates_dir=Path("~/.cache/himawari-gbr/templates").expanduser(),
+    # templates_dir is only safe for CMSK; do not pass it when loading CHGT or CPHS
 )
 # ds is fully lazy — dims: (time=6, Rows=1170, Columns=1104)
 
@@ -205,10 +212,11 @@ Generate (or load cached) kerchunk JSON references for multiple files using a th
 Three modes in order of preference:
 - **`templates_dir`** — directory of product templates produced by
   `scripts/create_product_templates.py`; derives all references via URL substitution
-  with zero S3 round-trips.
+  with zero S3 round-trips.  **Only safe for CMSK** — CHGT and CPHS have non-uniform
+  chunk layouts and will produce wrong offsets.
 - **`use_template=True`** — generates one reference from S3 and templates the rest;
-  opt-in because it assumes identical internal file layouts.
-- **default** — generates each reference independently from S3 (safe, one call per file).
+  opt-in because it assumes identical internal file layouts.  Same safety caveat as above.
+- **default** — generates each reference independently from S3 (always safe, one call per file).
 
 ### `build_combined_reference(ref_paths, s3_keys, output_dir)`
 Combine per-file references into a Parquet virtual store via `MultiZarrToZarr`.
@@ -232,8 +240,8 @@ One-time utility to derive pixel bounds for a custom geographic region from the 
 
 ### `load_gbr_cloud_data(products, start_dt, end_dt, cache_dir=None, templates_dir=None, ...)`
 Full-pipeline convenience wrapper. Runs all steps above, merges multiple products along
-shared dimensions, and returns a lazy GBR-subsetted Dataset. Pass `templates_dir` to
-enable zero-S3-call reference generation for all products.
+shared dimensions, and returns a lazy GBR-subsetted Dataset. Pass `templates_dir` only
+when all requested products are CMSK — it is not safe for CHGT or CPHS.
 
 ---
 
@@ -263,9 +271,9 @@ Fill values (off-disk / no-retrieval pixels) are encoded as `NaN` after `mask_an
 ```
 ~/.cache/himawari-gbr/
 ├── templates/                                         (created by create_product_templates.py)
-│   ├── CMSK_template.json                             (~2 MB, _template_source embedded)
-│   ├── CHGT_template.json
-│   └── CPHS_template.json
+│   ├── CMSK_template.json                             (~2 MB, safe to use with templates_dir=)
+│   ├── CHGT_template.json                             (do NOT use with templates_dir=)
+│   └── CPHS_template.json                             (do NOT use with templates_dir=)
 ├── refs/
 │   └── AHI-L2-FLDK-Clouds/2024/01/01/0000/
 │       ├── AHI-CMSK_v1r1_h09_s202401010000...json   (~2 MB per file)
@@ -285,6 +293,18 @@ regenerate. Product templates only need to be regenerated after a NOAA software 
 ---
 
 ## Known issues and fixes
+
+**Template-based generation is unsafe for CHGT and CPHS**
+CHGT and CPHS variables contain continuous floating-point retrievals.  zlib compresses them
+to different sizes at each scan time, so chunk byte offsets are not uniform across files.
+Using `templates_dir` for these products generates references with wrong byte offsets that
+fail silently until the data is actually read, producing `Error -3 while decompressing data:
+incorrect header check`.  Recovery: delete the corrupted JSON refs and any combined Parquet
+stores built from them, then rerun without `templates_dir`:
+```bash
+find ~/.cache/himawari-gbr/refs -name 'AHI-CHGT*.json' -delete
+rm -rf ~/.cache/himawari-gbr/combined/CHGT_*
+```
 
 **zarr ≥ 2.17 / kerchunk 0.2.x fill-value incompatibility**
 HDF5 files store `_FillValue` attributes as 1-element NumPy arrays. zarr 2.17+
@@ -306,15 +326,18 @@ not yet compatible with the kerchunk reference filesystem interface used here.
 
 ### `scripts/create_product_templates.py`
 
-One-time setup that fetches a single file per product and saves a reusable kerchunk
-reference template. Run this before using `templates_dir` in the pipeline:
+One-time setup that fetches a single file per product and saves a kerchunk reference
+template for each.  Run this before using `templates_dir=` in the pipeline:
 
 ```bash
 python scripts/create_product_templates.py
 python scripts/create_product_templates.py --date 2024-06-01 --cache-dir /fast/ssd/cache
 ```
 
-Re-run if NOAA deploys a new software version that changes the internal HDF5 file layout.
+**Only the CMSK template is safe to use with `templates_dir=`.**  CHGT and CPHS have
+variable chunk byte offsets across files (continuous float data, variable zlib compression
+ratios) so template substitution produces wrong references.  Pass `templates_dir` only when
+loading CMSK.  Re-run after a NOAA software update that changes the internal HDF5 layout.
 
 ---
 
